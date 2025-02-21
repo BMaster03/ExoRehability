@@ -1,0 +1,12 @@
+# Ignorar todo por defecto
+/*
+
+# No ignorar estas carpetas y archivos específicos
+!/src/
+!/README.md
+!/requirements.txt
+!/main.py
+!/.gitignore
+
+
+
