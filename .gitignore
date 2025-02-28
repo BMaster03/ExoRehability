@@ -2,7 +2,8 @@
 /*
 
 # No ignorar estas carpetas y archivos específicos
-!/src/
+!/Laptop_client/
+!/RaspberryPi5_server/
 !/README.md
 !/requirements.txt
 !/main.py
