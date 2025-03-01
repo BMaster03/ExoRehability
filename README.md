@@ -1,1 +1,1 @@
-this proyect is for colab
+code of proyect
