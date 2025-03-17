@@ -1,13 +1,18 @@
-# Ignorar todo por defecto
+# Ignorar todo en la raíz del proyecto
 /*
+
+# Ignorar todas las carpetas __pycache__
+__pycache__/
+
+# Ignorar __pycache__ específicamente en GUI
+Laptop_client/GUI/__pycache__/
 
 # No ignorar estas carpetas y archivos específicos
 !/Laptop_client/
-!/RaspberryPi5_server/
+!/RaspberryP15_server/
 !/README.md
 !/requirements.txt
 !/main.py
 !/.gitignore
-
-
+!/Testing/
 
