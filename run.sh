@@ -21,4 +21,4 @@ echo "[$(date)] Script run.sh ejecutado al inicio" >> /home/pi/run_exo.log
 feh --fullscreen /usr/share/rpd-wallpaper/road.jpg &
 
 # 6. Ejecutar código principal
-python3 main.py
+# python3 main.py
