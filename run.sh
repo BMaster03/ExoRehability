@@ -1,22 +1,15 @@
 #!/usr/bin/env bash
-# =======================================
-# Script de inicio automático RaspberryPi5 - ExoRehability
-# =======================================
+set -euo pipefail
+cd /home/pi/Documents/Repositorios/ExoRehability || exit 1
 
-# 1. Ruta de trabajo
-cd /home/pi/Documents/Repositorios/ExoRehability || exit
+# venv (si existe)
+[ -f venv/bin/activate ] && source venv/bin/activate
 
-# 2. Activar entorno virtual
-source venv/bin/activate
+# actualizar (no fallar si no hay red)
+git pull origin raspberrypi5 || echo "[WARN] git pull falló, sigo local"
 
-# 3. Actualizar repo
-git pull origin raspberrypi5
+# prueba visual (requiere: sudo apt install feh)
+feh --fullscreen /home/pi/Downloads/linux.png &
 
-# 4. Registrar inicio en log
-echo "[$(date)] Script run.sh ejecutado al inicio" >> /home/pi/run_exo.log
-
-# 5. Mostrar imagen como prueba (requiere feh instalado: sudo apt install feh)
-feh --fullscreen /usr/share/rpd-wallpaper/road.jpg &
-
-# 6. Ejecutar código principal
+# tu app (descomenta cuando quieras)
 # python3 main.py
