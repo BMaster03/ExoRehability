@@ -14,5 +14,6 @@ Laptop_client/GUI/__pycache__/
 !/requirements.txt
 !/main.py
 !/.gitignore
+!/assets/arm.png
 
 
