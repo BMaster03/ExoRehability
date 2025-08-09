@@ -1,5 +1,3 @@
-# This .sh is for "run_code" of ExoRehability
-
 #!/usr/bin/env bash
 # =======================================
 # Script de inicio automático RaspberryPi5 - ExoRehability
