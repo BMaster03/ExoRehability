@@ -14,6 +14,9 @@
 !/run.sh
 !/.gitignore
 !/options.py
+!/emg_processing/
+!/sensores_AD8232.ino
+
 
 # =======================================
 # Ignorar carpetas __pycache__
