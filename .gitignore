@@ -14,7 +14,6 @@
 !/run.sh
 !/.gitignore
 !/options.py
-!/sensores_AD8232.ino
 
 # =======================================
 # Ignorar carpetas __pycache__
