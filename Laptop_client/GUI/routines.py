@@ -1,9 +1,25 @@
+# routines.py
+from __future__ import annotations
 from time import sleep
 import threading
-from gpiozero import DigitalOutputDevice, Device  # type: ignore
-from gpiozero.pins.lgpio import LGPIOFactory      # type: ignore
 
-Device.pin_factory = LGPIOFactory()
+# --- Intentamos usar GPIO real; si falla, simulamos (útil en laptop) ---
+try:
+    from gpiozero import DigitalOutputDevice, Device  # type: ignore
+    from gpiozero.pins.lgpio import LGPIOFactory      # type: ignore
+    Device.pin_factory = LGPIOFactory()
+    _GPIO_OK = True
+except Exception:
+    _GPIO_OK = False
+
+    class DigitalOutputDevice:  # simulador mínimo
+        def __init__(self, pin, active_high=True, initial_value=False):
+            self.pin = pin
+            self.state = bool(initial_value)
+        def on(self):  self.state = True
+        def off(self): self.state = False
+        def close(self): self.off()
+
 
 class ControlActuadores:
     """
@@ -14,7 +30,7 @@ class ControlActuadores:
     Seguridad:
     - Interlock: nunca A y B activos a la vez
     - Deadtime: pequeña pausa antes de invertir sentido
-    - HOME: todo OFF al inicio y al finalizar cada rutina
+    - HOME: todo OFF; además exponemos home_now() que hace 3s de 'close' en paralelo.
     """
 
     RELAY_PINS_BCM = {
@@ -29,23 +45,14 @@ class ControlActuadores:
 
     def __init__(self, actualizar_estado=None):
         self.actualizar_estado = actualizar_estado
-
-        self.actuadores = {
-            1: {"estado": "reposo"},
-            2: {"estado": "reposo"},
-            3: {"estado": "reposo"},
-            4: {"estado": "reposo"},
-            5: {"estado": "reposo"},
-        }
-
         self.relays = {}
         for n, pins in self.RELAY_PINS_BCM.items():
             self.relays[n] = {
                 "A": DigitalOutputDevice(pins["A"], active_high=True, initial_value=False),
                 "B": DigitalOutputDevice(pins["B"], active_high=True, initial_value=False),
             }
-
-        self._msg("Inicializando controlador de actuadores (GPIO listo con LGPIO).")
+        self._msg("Inicializando controlador de actuadores "
+                  + ("(GPIO real LGPIO)." if _GPIO_OK else "(SIM sin GPIO)."))
         self.posicion_reposo()
 
     # ------------------------ utilidades de log ------------------------
@@ -58,116 +65,128 @@ class ControlActuadores:
                 pass
 
     # ------------------------ API pública ------------------------------
-    def activar_actuador(self, actuador_num: int):
-        self.actuadores[actuador_num]["estado"] = "activo"
-        self._msg(f"Actuador {actuador_num}: Activado (lógico).")
+    def posicion_reposo(self):
+        """Todo OFF."""
+        for n in self.relays:
+            self._both_off(n)
+        self._msg("Todos los actuadores en reposo (OFF).")
 
-    def desactivar_actuador(self, actuador_num: int):
-        self.actuadores[actuador_num]["estado"] = "reposo"
-        self._both_off(actuador_num)
-        self._msg(f"Actuador {actuador_num}: Desactivado (A=OFF, B=OFF).")
+    def home_now(self, close_seconds: float = 3.0):
+        """
+        'HOME' mecánico: pone TODOS en 'close' durante close_seconds en paralelo
+        y luego OFF. Útil para regresar al origen.
+        """
+        self._msg(f"HOME: todos en 'close' {close_seconds:.2f}s en paralelo...")
+        tareas = [lambda n=n: self._drive(n, "close", float(close_seconds)) for n in self.relays]
+        self._run_parallel(tareas)
+        self.posicion_reposo()
+        self._msg("HOME completado.")
 
-    def mover_actuador(self, actuador_num: int, tiempo_avance: float, tiempo_pause: float,
-                       tiempo_retroceso: float, sentido_inicio: str = "open"):
+    def stop_and_home(self, stop_event: threading.Event | None = None, close_seconds: float = 3.0):
+        """
+        Señal de paro + HOME. Si recibimos stop_event lo marcamos, y ejecutamos HOME.
+        """
+        if stop_event:
+            stop_event.set()
+        self._msg("PARO solicitado: llevando a HOME.")
+        self.home_now(close_seconds=close_seconds)
+
+    def mover_actuador(self, actuador_num: int, tiempo_avance: float,
+                       tiempo_pause: float, tiempo_retroceso: float,
+                       sentido_inicio: str = "open",
+                       stop_event: threading.Event | None = None):
         """
         Secuencia completa para 1 actuador: avance -> pausa -> retroceso.
+        Responde a stop_event si se marca entre fases.
         """
-        self._msg(f"Moviendo Actuador {actuador_num}...")
-        self.activar_actuador(actuador_num)
+        if stop_event and stop_event.is_set():
+            return
 
+        self._msg(f"Actuador {actuador_num}: Avance {tiempo_avance}s, pausa {tiempo_pause}s, retroceso {tiempo_retroceso}s.")
         # Avance
         self._drive(actuador_num, sentido=sentido_inicio, dur_s=float(tiempo_avance))
-        self._msg(f"Actuador {actuador_num}: Avanzando por {tiempo_avance} s.")
+        if stop_event and stop_event.is_set():
+            return
 
-        # Pausa con todo en OFF
+        # Pausa OFF
         self._both_off(actuador_num)
-        self._msg(f"Actuador {actuador_num}: En pausa por {tiempo_pause} s.")
-        sleep(max(0.0, float(tiempo_pause)))
+        self._sleep_with_stop(tiempo_pause, stop_event)
+        if stop_event and stop_event.is_set():
+            return
 
         # Retroceso
         sentido_vuelta = "close" if sentido_inicio == "open" else "open"
         self._drive(actuador_num, sentido=sentido_vuelta, dur_s=float(tiempo_retroceso))
-        self._msg(f"Actuador {actuador_num}: Retrocediendo por {tiempo_retroceso} s.")
+        self._both_off(actuador_num)
 
-        # Finaliza
-        self.desactivar_actuador(actuador_num)
-        self._msg(f"Actuador {actuador_num}: Detenido.\n")
+    # ------------------------ Rutinas base --------------------------------
+    def rutina_1_once(self, stop_event: threading.Event | None = None):
+        """Todos (1..5) en paralelo: 2s avance, 4s pausa, 2s retroceso."""
+        self._msg("Rutina 1 (paralela) - una pasada.")
+        tareas = [
+            (lambda n=n: self.mover_actuador(n, 2, 4, 2, "open", stop_event))
+            for n in (1, 2, 3, 4, 5)
+        ]
+        self._run_parallel(tareas)
 
-    def posicion_reposo(self):
-        self._msg("Llevando todos los actuadores a la posición de reposo (HOME)...")
-        for actuador_num in self.actuadores:
-            self._both_off(actuador_num)
-            self.actuadores[actuador_num]["estado"] = "reposo"
-        self._msg("Todos los actuadores en reposo.\n")
+    def rutina_2_once(self, stop_event: threading.Event | None = None):
+        """Todos (1..5) en paralelo: 0.5s avance, 4s pausa, 0.5s retroceso."""
+        self._msg("Rutina 2 (paralela) - una pasada.")
+        tareas = [
+            (lambda n=n: self.mover_actuador(n, 0.5, 4, 0.5, "open", stop_event))
+            for n in (1, 2, 3, 4, 5)
+        ]
+        self._run_parallel(tareas)
 
-    # ------------------------ Rutinas EN PARALELO ----------------------
-    def _run_parallel(self, tareas):
+    def rutina_3_once(self, stop_event: threading.Event | None = None):
         """
-        Ejecuta en paralelo una lista de callables (sin argumentos) y espera a que terminen.
+        Patrón pedido:
+        1) Cuatro dedos (2,3,4,5) en paralelo: avance/pausa/retroceso.
+        2) Pulgar (1) solo.
+        3) Cuatro dedos (2,3,4,5) otra vez.
+        4) Pulgar (1) otra vez.
+        5) Cuatro dedos (2,3,4,5) de nuevo.
+        Tiempos ejemplo (ajústalos si quieres): avance=2s, pausa=1s, retroceso=2s.
         """
-        hilos = [threading.Thread(target=t, daemon=True) for t in tareas]
-        for th in hilos:
-            th.start()
-        for th in hilos:
-            th.join()
-
-    def rutina_1(self):
-        """
-        Rutina 1 (PARALELA):
-        Todos los actuadores 1..5 avanzan al mismo tiempo 2s, pausa 1s, retroceso 2s.
-        """
-        self._msg("Iniciando Rutina 1 (paralela)...")
-        try:
-            self.posicion_reposo()
+        self._msg("Rutina 3 (patrón 4 dedos ↔ pulgar) - una pasada.")
+        grupos = [
+            (2, 3, 4, 5),
+            (1,),
+            (2, 3, 4, 5),
+            (1,),
+            (2, 3, 4, 5),
+        ]
+        for grupo in grupos:
+            if stop_event and stop_event.is_set():
+                return
             tareas = [
-                (lambda n=n: self.mover_actuador(n, 2, 1, 2, "open"))
-                for n in (1, 2, 3, 4, 5)
+                (lambda n=n: self.mover_actuador(n, 2, 1, 2, "open", stop_event))
+                for n in grupo
             ]
             self._run_parallel(tareas)
-            self._msg("Rutina 1 completada.\n")
-        finally:
-            self.posicion_reposo()
 
-    def rutina_2(self):
+    # ------------------------ API de ciclos --------------------------------
+    def run_routine(self, name: str, cycles: int = 1, stop_event: threading.Event | None = None):
         """
-        Rutina 2 (PARALELA):
-        Todos los actuadores 1..5 avanzan al mismo tiempo 2s, pausa 1s, retroceso 2s.
-        (Mantengo los mismos tiempos para coherencia; si quieres otros, cámbialos aquí.)
+        Ejecuta la rutina 'name' el número de 'cycles', respetando stop_event.
+        name: "Rutina 1" | "Rutina 2" | "Rutina 3"
         """
-        self._msg("Iniciando Rutina 2 (paralela)...")
+        self._msg(f"Ejecutando {name} por {cycles} ciclo(s).")
         try:
-            self.posicion_reposo()
-            tareas = [
-                (lambda n=n: self.mover_actuador(n, 2, 1, 2, "open"))
-                for n in (1, 2, 3, 4, 5)
-            ]
-            self._run_parallel(tareas)
-            self._msg("Rutina 2 completada.\n")
-        finally:
-            self.posicion_reposo()
-
-    def rutina_3(self):
-        """
-        Rutina 3 (PARALELA):
-        Ejemplo con tiempos distintos por actuador, pero todos arrancan juntos.
-        - 3: 2s, pausa 1s, ret 1s
-        - 1: 1s, pausa 1s, ret 2s
-        - 5: 3s, pausa 1s, ret 1s
-        - 2: 1s, pausa 1s, ret 1s
-        - 4: 2s, pausa 1s, ret 2s
-        """
-        self._msg("Iniciando Rutina 3 (paralela)...")
-        try:
-            self.posicion_reposo()
-            tareas = [
-                (lambda: self.mover_actuador(3, 2, 1, 1, "open")),
-                (lambda: self.mover_actuador(1, 1, 1, 2, "open")),
-                (lambda: self.mover_actuador(5, 3, 1, 1, "open")),
-                (lambda: self.mover_actuador(2, 1, 1, 1, "open")),
-                (lambda: self.mover_actuador(4, 2, 1, 2, "open")),
-            ]
-            self._run_parallel(tareas)
-            self._msg("Rutina 3 completada.\n")
+            for i in range(cycles):
+                if stop_event and stop_event.is_set():
+                    break
+                self._msg(f"→ Ciclo {i+1}/{cycles}")
+                if name == "Rutina 1":
+                    self.rutina_1_once(stop_event)
+                elif name == "Rutina 2":
+                    self.rutina_2_once(stop_event)
+                elif name == "Rutina 3":
+                    self.rutina_3_once(stop_event)
+                else:
+                    self._msg(f"Rutina desconocida: {name}")
+                    break
+            self._msg(f"{name} finalizada.")
         finally:
             self.posicion_reposo()
 
@@ -199,9 +218,22 @@ class ControlActuadores:
         A.off(); B.off()
         sleep(self.deadtime_s)
 
-    def limpiar(self):
-        self._msg("Limpiando: apagando todos los relés y liberando GPIO.")
-        self.posicion_reposo()
-        for n in self.relays:
-            self.relays[n]["A"].close()
-            self.relays[n]["B"].close()
+    def _run_parallel(self, tareas: list[callable]):
+        """Ejecuta en paralelo una lista de callables (sin args) y espera a que terminen."""
+        hilos = [threading.Thread(target=t, daemon=True) for t in tareas]
+        for th in hilos: th.start()
+        for th in hilos: th.join()
+
+    def _sleep_with_stop(self, dur: float, stop_event: threading.Event | None):
+        """Espera 'dur' segundos comprobando stop_event para poder abortar pausa."""
+        if dur <= 0:
+            return
+        end = max(0.0, float(dur))
+        step = 0.05
+        t = 0.0
+        while t < end:
+            if stop_event and stop_event.is_set():
+                return
+            sl = min(step, end - t)
+            sleep(sl)
+            t += sl

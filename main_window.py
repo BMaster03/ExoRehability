@@ -4,21 +4,17 @@ import threading
 import time
 import socket
 from dataclasses import dataclass
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Callable
 import flet as ft
 from flet import canvas as cv
 import webbrowser
-import sys
-import os
 
 # ================= CONFIG (Raspberry Pi 5) =================
-# Cambia HOST a la IP de tu Raspberry si quieres abrir desde otras máquinas.
-# Para exponer en todas las interfaces puedes usar "0.0.0.0".
-HOST = "169.254.69.170"
+HOST = "169.254.69.170"   # IP fija de la Pi
 START_PORT = 5000
 ASSETS_DIR = "assets"
 OPEN_BROWSER_ON_SERVER = True
-# ==========================================================
+# ===========================================================
 
 def _find_free_port(host: str, start_port: int, tries: int = 50) -> int:
     for p in range(start_port, start_port + tries):
@@ -27,11 +23,6 @@ def _find_free_port(host: str, start_port: int, tries: int = 50) -> int:
             if s.connect_ex((host, p)) != 0:
                 return p
     raise RuntimeError("No hay puertos libres en el rango solicitado.")
-
-# Asegura que el paquete local emg_processing sea importable
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-if PROJECT_ROOT not in sys.path:
-    sys.path.append(PROJECT_ROOT)
 
 # ---------------------- Datos usuarios/pacientes -----------------------------
 @dataclass
@@ -72,7 +63,7 @@ def sample_patients_by_user() -> Dict[str, List[Patient]]:
     }
 
 # ---------------------- BottomSheets usuarios/pacientes ----------------------
-def open_users_sheet(page: ft.Page, on_user_selected):
+def open_users_sheet(page: ft.Page, on_user_selected: Callable[[User], None]):
     data = sample_users()
 
     detail_title = ft.Text("Selecciona un usuario", size=18, weight=ft.FontWeight.BOLD)
@@ -170,7 +161,7 @@ def open_users_sheet(page: ft.Page, on_user_selected):
     bs = ft.BottomSheet(content=sheet_content, open=True, show_drag_handle=True, is_scroll_controlled=True)
     page.overlay.append(bs); bs.open = True; page.update()
 
-def open_patients_sheet(page: ft.Page, selected_user: Optional[User], on_patient_selected):
+def open_patients_sheet(page: ft.Page, selected_user: Optional[User], on_patient_selected: Callable[[Patient], None]):
     if not selected_user:
         page.snack_bar = ft.SnackBar(ft.Text("Selecciona un usuario primero."), bgcolor=ft.Colors.RED_700)
         page.snack_bar.open = True; page.update(); return
@@ -328,16 +319,10 @@ class Scope:
         self.canvas.shapes.append(cv.Fill(path=fill_path,
                                    paint=ft.Paint(color=ft.Colors.with_opacity(0.18, ft.Colors.AMBER))))
 
-# Motor de datos en tiempo real (usa el simulador)
+# Motor de datos en tiempo real (simulación sencilla si no importas tu EMG)
 class EMGEngine:
-    def __init__(self, page: ft.Page, scope1: Scope, scope2: Scope,
+    def __init__(self, page: ft.Page, scope1: Scope, scope2: Scope | None,
                  seconds_window=5.0, fs=300):
-        # Import flexible para que funcione tanto en Pi como en laptop
-        try:
-            from RaspberryPI5_server.emg_processing.signal_filter import EMGSimulator  # paquete local
-        except Exception:
-            # Fallback a una ruta alternativa si usas otra estructura
-            from RaspberryPI5_server.emg_processing.signal_filter import EMGSimulator  # type: ignore
         self.page = page
         self.scope1, self.scope2 = scope1, scope2
         self.fs = fs
@@ -348,49 +333,56 @@ class EMGEngine:
         self.y2: list[float] = []
         self._stop = threading.Event()
         self._running = False
-        self.sim = EMGSimulator(fs=self.fs, channels=2)
+        self._t0 = 0.0
 
     def start(self):
         if self._running:
-            print("Sensor ya estaba en marcha."); return
+            return
         self._stop.clear()
         threading.Thread(target=self._loop, daemon=True).start()
         self._running = True
-        print("Sensor: START")
 
     def stop(self):
         if not self._running:
-            print("Sensor: STOP (ya detenido)"); return
+            return
         self._stop.set()
         self._running = False
-        print("Sensor: STOP")
 
     def reset(self):
-        if hasattr(self.sim, "reset"):
-            self.sim.reset()
         self.t.clear(); self.y1.clear(); self.y2.clear()
         self._render()
-        print("Sensor: RESET")
 
     def _loop(self):
         block = max(3, int(self.fs * 0.03))  # ~30 ms
         t0 = self.t[-1] if self.t else 0.0
+        import math, random
         while not self._stop.is_set():
-            chunk = self.sim.next_chunk(block)   # [2][block]
-            ch1, ch2 = chunk[0], chunk[1]
+            # Fallback de EMG simple
             dt = 1.0 / self.fs
+            ch1, ch2 = [], []
+            for i in range(block):
+                tt = self._t0 + (i+1)*dt
+                val = 0.8 * math.sin(2*math.pi*5*tt) + 0.25*random.random()
+                ch1.append(val); ch2.append(val * 0.6)
+            self._t0 += block * dt
+
             x = [t0 + (i+1)*dt for i in range(block)]
             t0 = x[-1]
-            self.t.extend(x); self.y1.extend(ch1); self.y2.extend(ch2)
+            self.t.extend(x); self.y1.extend(ch1)
+            if self.scope2 is not None:
+                self.y2.extend(ch2)
             if len(self.t) > self.max_pts:
                 extra = len(self.t) - self.max_pts
-                self.t = self.t[extra:]; self.y1 = self.y1[extra:]; self.y2 = self.y2[extra:]
+                self.t = self.t[extra:]; self.y1 = self.y1[extra:]
+                if self.scope2 is not None:
+                    self.y2 = self.y2[extra:]
             self._render()
             time.sleep(0.03)
 
     def _render(self):
         self.scope1.update_wave(self.t, self.y1, color=ft.Colors.AMBER_200)
-        self.scope2.update_wave(self.t, self.y2, color=ft.Colors.CYAN_200)
+        if self.scope2 is not None:
+            self.scope2.update_wave(self.t, self.y2, color=ft.Colors.CYAN_200)
         self.page.update()
 
 # ---------------------- UI principal ----------------------------------------
@@ -408,7 +400,7 @@ def window_main(page: ft.Page):
     def push_log(txt: str, color=ft.Colors.GREY_300):
         log_list.controls.append(ft.Text(txt, size=12, color=color)); page.update()
 
-    estado_title = ft.Text("SIM: controlador iniciado (sin GPIO).", size=14, color=ft.Colors.GREY_200)
+    estado_title = ft.Text("Inicializando…", size=14, color=ft.Colors.GREY_200)
 
     estado_card = ft.Card(
         content=ft.Container(
@@ -429,42 +421,35 @@ def window_main(page: ft.Page):
         bgcolor=ft.Colors.TRANSPARENT, elevation=0, toolbar_height=40,
     )
 
-    # ===== Controlador real (rutinas/gpio) o simulado =====
+    # ===== Controlador GPIO a través de routines.py =====
     def actualizar_estado(msg: str):
         push_log(msg, ft.Colors.GREY_300)
 
     try:
-        # Importa tus rutinas reales desde routines.py (en el mismo dir que main_window.py)
-        from Laptop_client.GUI.routines import ControlActuadores  # <-- usando gpiozero LGPIOFactory
+        from Laptop_client.GUI.routines import ControlActuadores
         controlador = ControlActuadores(actualizar_estado=actualizar_estado)
-        estado_title.value = "GPIO listo (LGPIO)."
+        estado_title.value = "GPIO listo (LGPIO) o SIM según entorno."
     except Exception as ex:
-        # Fallback simulado con mismas firmas de métodos
-        push_log(f"[AVISO] Usando controlador SIMULADO: {ex}", ft.Colors.AMBER_200)
+        # Respaldo mínimo si hubiera error importando routines.py
         class ControlActuadores:
             def __init__(self, actualizar_estado=None):
                 self.actualizar_estado = actualizar_estado
-                self._log("SIM: controlador iniciado (sin GPIO).")
-            def _log(self, msg):
-                if self.actualizar_estado: self.actualizar_estado(msg)
-            def posicion_reposo(self):
-                self._log("SIM: HOME (todos OFF).")
-            def mover_actuador(self, num, t_av, t_pause, t_ret, sentido_inicio="open"):
-                self._log(f"SIM: mover_actuador num={num} av={t_av}s pause={t_pause}s ret={t_ret}s sentido={sentido_inicio}")
-            def rutina_1(self):
-                self._log("SIM: rutina_1 inicia"); time.sleep(0.5); self._log("SIM: rutina_1 fin")
-            def rutina_2(self):
-                self._log("SIM: rutina_2 inicia"); time.sleep(0.5); self._log("SIM: rutina_2 fin")
-            def rutina_3(self):
-                self._log("SIM: rutina_3 inicia"); time.sleep(0.5); self._log("SIM: rutina_3 fin")
-            def limpiar(self):
-                self._log("SIM: limpiar()")
+                if actualizar_estado: actualizar_estado(f"SIM: controlador (sin GPIO). Motivo: {ex}")
+            def home_now(self, s=3.0): 
+                if self.actualizar_estado: self.actualizar_estado(f"SIM: home_now({s})")
+            def stop_and_home(self, stop_event=None, close_seconds=3.0):
+                if stop_event: stop_event.set()
+                if self.actualizar_estado: self.actualizar_estado("SIM: stop_and_home()")
+            def mover_actuador(self, *a, **k):
+                if self.actualizar_estado: self.actualizar_estado(f"SIM: mover_actuador{a}{k}")
+            def run_routine(self, name, cycles=1, stop_event=None):
+                if self.actualizar_estado: self.actualizar_estado(f"SIM: run_routine({name}, cycles={cycles})")
         controlador = ControlActuadores(actualizar_estado=actualizar_estado)
+        estado_title.value = "SIM sin GPIO"
 
     # ===== Estado de selección (Usuarios/Pacientes) =====
     selected_user: Optional[User] = None
 
-    # Botones Usuarios / Pacientes
     usuarios_btn = ft.OutlinedButton("Usuarios", icon=ft.Icons.PERSON,
                                      style=ft.ButtonStyle(color=ft.Colors.WHITE),
                                      on_click=lambda e: open_users_sheet(page, on_user_selected))
@@ -494,43 +479,100 @@ def window_main(page: ft.Page):
         shape=ft.RoundedRectangleBorder(radius=12),
     )
 
-    # ===== RUTINAS (DropDown + Ejecutar) =====
-    rutina = ft.Dropdown(
-        options=[ft.dropdown.Option(f"Rutina {i}") for i in range(1, 4)],
-        width=220, hint_text="Selecciona una rutina",
-        on_change=lambda e: (setattr(btn_ejecutar, "disabled", not bool(rutina.value)), page.update()),
-        text_style=ft.TextStyle(color=ft.Colors.WHITE), hint_style=ft.TextStyle(color=ft.Colors.GREY_400),
+    # ===== RUTINAS (con ciclos + PARO) =====
+    stop_event = threading.Event()
+
+    rutina_dd = ft.Dropdown(
+        options=[
+            ft.dropdown.Option("Rutina 1"),
+            ft.dropdown.Option("Rutina 2"),
+            ft.dropdown.Option("Rutina 3"),
+        ],
+        value="Rutina 1",
+        width=220, hint_text="Elige rutina",
+        text_style=ft.TextStyle(color=ft.Colors.WHITE),
+        hint_style=ft.TextStyle(color=ft.Colors.GREY_400),
     )
 
-    def ejecutar_rutina(e):
-        if not rutina.value:
-            return
-        rutina_sel = rutina.value
-        btn_ejecutar.disabled = True; page.update()
-        push_log(f"→ {rutina_sel} iniciada", ft.Colors.GREEN_200)
+    ciclos_tf = ft.TextField(
+        value="1", width=80, label="Ciclos", text_align=ft.TextAlign.RIGHT,
+        input_filter=ft.InputFilter(allow=True, regex_string=r"[0-9]", replacement_string=""),
+        label_style=ft.TextStyle(color=ft.Colors.GREY_500)
+    )
+    delay_tf = ft.TextField(   # estético; no lo usa run_routine()
+        value="0", width=100, label="Delay (s)", text_align=ft.TextAlign.RIGHT,
+        input_filter=ft.InputFilter(allow=True, regex_string=r"[0-9\.]", replacement_string=""),
+        label_style=ft.TextStyle(color=ft.Colors.GREY_500)
+    )
 
+    def _run_thread(fn):
+        threading.Thread(target=fn, daemon=True).start()
+
+    def ejecutar_una_vez(e):
+        name = rutina_dd.value or "Rutina 1"
+        stop_event.clear()
         def run():
             try:
-                # Llama a rutina_1 / rutina_2 / rutina_3 del controlador real
-                getattr(controlador, f"rutina_{rutina_sel[-1]}")()
-                push_log(f"✓ {rutina_sel} completada", ft.Colors.GREEN_200)
+                push_log(f"→ Ejecutando {name} (1 vez)", ft.Colors.GREEN_200)
+                controlador.run_routine(name, cycles=1, stop_event=stop_event)
+                push_log(f"✓ {name} completada", ft.Colors.GREEN_200)
             except Exception as ex:
-                push_log(f"✖ Error en {rutina_sel}: {ex}", ft.Colors.RED_200)
-            finally:
-                btn_ejecutar.disabled = False; page.update()
-        threading.Thread(target=run, daemon=True).start()
+                push_log(f"✖ Error en {name}: {ex}", ft.Colors.RED_200)
+        _run_thread(run)
 
-    btn_ejecutar = ft.FilledButton(
-        text="🚀 Ejecutar Rutina", on_click=ejecutar_rutina,
+    def ejecutar_en_ciclos(e):
+        name = rutina_dd.value or "Rutina 1"
+        stop_event.clear()
+        try:
+            n = int(ciclos_tf.value or "1")
+            if n < 1: n = 1
+        except:
+            n = 1
+        def run():
+            try:
+                push_log(f"→ Ejecutando {name} en {n} ciclo(s)", ft.Colors.GREEN_200)
+                controlador.run_routine(name, cycles=n, stop_event=stop_event)
+                push_log(f"✓ {name} ciclos completados", ft.Colors.GREEN_200)
+            except Exception as ex:
+                push_log(f"✖ Error en ciclos de {name}: {ex}", ft.Colors.RED_200)
+        _run_thread(run)
+
+    def parar_rutina_home(e):
+        def run():
+            try:
+                push_log("⛔ Paro de rutina solicitado…", ft.Colors.AMBER_200)
+                controlador.stop_and_home(stop_event, close_seconds=3.0)
+                push_log("✓ Rutina detenida y HOME aplicado.", ft.Colors.GREEN_200)
+            except Exception as ex:
+                push_log(f"✖ Error en paro de rutina: {ex}", ft.Colors.RED_200)
+        _run_thread(run)
+
+    btn_una_vez = ft.FilledButton(
+        text="▶ Ejecutar (1 vez)", on_click=ejecutar_una_vez,
         bgcolor=ft.Colors.INDIGO, color=ft.Colors.WHITE,
         style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=20)),
-        disabled=True
+    )
+    btn_ciclos = ft.FilledButton(
+        text="🔁 Ejecutar en ciclos", on_click=ejecutar_en_ciclos,
+        bgcolor=ft.Colors.DEEP_PURPLE, color=ft.Colors.WHITE,
+        style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=20)),
+    )
+    btn_paro = ft.FilledButton(
+        text="⛔ Paro de rutina (HOME)", on_click=parar_rutina_home,
+        bgcolor=ft.Colors.RED_700, color=ft.Colors.WHITE,
+        style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=20)),
     )
 
     rutinas_card = ft.Card(
         content=ft.Container(
             content=ft.Column(
-                [ft.Text("Rutinas", size=14, color=ft.Colors.GREY_300), rutina, btn_ejecutar],
+                [
+                    ft.Text("Rutinas", size=14, color=ft.Colors.GREY_300),
+                    rutina_dd,
+                    ft.Row([ciclos_tf, delay_tf], spacing=8),
+                    ft.Row([btn_una_vez, btn_ciclos], spacing=8),
+                    ft.Row([btn_paro], alignment=ft.MainAxisAlignment.CENTER),
+                ],
                 spacing=10),
             padding=8, width=360),
         elevation=2, color=ft.Colors.with_opacity(0.1, ft.Colors.WHITE),
@@ -583,13 +625,12 @@ def window_main(page: ft.Page):
                             ft.FilledButton(
                                 "🏠 HOME",
                                 on_click=lambda e: (
-                                    threading.Thread(target=controlador.posicion_reposo, daemon=True).start(),
-                                    push_log("HOME: todos OFF", ft.Colors.BLUE_200)
+                                    threading.Thread(target=lambda: controlador.home_now(3.0), daemon=True).start(),
+                                    push_log("HOME forzado: retroceso 3s a todos", ft.Colors.BLUE_200)
                                 ),
                             ),
                         ],
-                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                    ),
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
                     ft.Divider(color=ft.Colors.WHITE),
                     control_row("Pulgar", 1),
                     control_row("Índice", 2),
@@ -604,7 +645,7 @@ def window_main(page: ft.Page):
         shape=ft.RoundedRectangleBorder(radius=12),
     )
 
-    # Gráficas con canvas (dos canales)
+    # ===== Gráficas EMG (dos canales simulados) =====
     scope1 = Scope("EMG - Canal 1", width=950, height=280, y_range_mV=6.0)
     scope2 = Scope("EMG - Canal 2", width=950, height=280, y_range_mV=6.0)
     charts_col = ft.Column([scope1.container, scope2.container], spacing=12, expand=True)
@@ -612,7 +653,7 @@ def window_main(page: ft.Page):
     # Motor RT
     engine = EMGEngine(page, scope1, scope2, seconds_window=5.0, fs=300)
 
-    # Botones sensor
+    # ===== Botones sensor (sim) =====
     def crear_boton(texto, icono, color, on_click=None):
         return ft.FilledButton(
             text=texto, icon=icono, bgcolor=color, color=ft.Colors.WHITE, on_click=on_click,
@@ -637,7 +678,7 @@ def window_main(page: ft.Page):
         shape=ft.RoundedRectangleBorder(radius=12),
     )
 
-    # Layout (rutinas entre usuarios y manual)
+    # ===== Layout =====
     left_container  = ft.Container(
         content=ft.Column([usuarios_card, rutinas_card, manual_panel], spacing=10),
         padding=0, alignment=ft.alignment.top_left,  width=372
@@ -656,15 +697,14 @@ def window_main(page: ft.Page):
                     spacing=0, expand=True)
     page.add(layout)
 
-    # Limpieza segura al desconectar / cerrar
+    # Limpieza segura al desconectar
     def _cleanup(*_):
         try:
-            controlador.posicion_reposo()
+            engine.stop()
         except Exception:
             pass
         try:
-            if hasattr(controlador, "limpiar"):
-                controlador.limpiar()
+            controlador.stop_and_home(stop_event, close_seconds=3.0)
         except Exception:
             pass
         push_log("Conexión cerrada: HOME aplicado.", ft.Colors.AMBER_200)
@@ -676,14 +716,11 @@ if __name__ == "__main__":
     print("\n[Flet] Iniciando servidor web…")
     print(f" - Host/IP: {HOST}")
     print(f" - Puerto : {port}")
-    if HOST in ("169.254.69.170", "0.0.0.0"):
-        print(f" - Abre en tu navegador:  http://169.254.69.170:{port}")
-    else:
-        print(f" - Abre en tu laptop:  http://{HOST}:{port}")
+    print(f" - Abre en tu navegador:  http://{HOST}:{port}")
 
     view_mode = ft.WEB_BROWSER if OPEN_BROWSER_ON_SERVER else None
     if OPEN_BROWSER_ON_SERVER:
-        try: webbrowser.open(f"http://169.254.69.170:{port}")
+        try: webbrowser.open(f"http://{HOST}:{port}")
         except Exception: pass
 
     ft.app(target=window_main, assets_dir=ASSETS_DIR, view=view_mode, host=HOST, port=port)
