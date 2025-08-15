@@ -17,7 +17,7 @@ import os
 HOST = "169.254.69.170"
 START_PORT = 5000
 ASSETS_DIR = "assets"
-OPEN_BROWSER_ON_SERVER = False
+OPEN_BROWSER_ON_SERVER = True
 # ==========================================================
 
 def _find_free_port(host: str, start_port: int, tries: int = 50) -> int:
